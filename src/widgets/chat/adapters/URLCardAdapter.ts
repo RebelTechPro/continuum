@@ -137,6 +137,200 @@ export class URLCardAdapter extends AbstractMessageAdapter<URLCardData> {
   }
 
   /**
+   * DOM-returning render path (see issue #1100). The legacy string
+   * path interpolated `${additionalText}` (user message text), `${url}`,
+   * `${domain}`, `${title}`, `${description}`, `${siteName}`, and
+   * `${favicon}` directly into HTML — at least the additionalText path
+   * is a real XSS hole (any user can craft a message with a URL plus
+   * markup and have it land in element-content position).
+   *
+   * This migration moves every user-controllable value to
+   * `.textContent` / property assignment / dataset, and keeps the
+   * class names + data-action attributes verbatim so:
+   *   - `handleContentLoading()` finds `.url-card`, `.url-card-loading`,
+   *     `.url-card-content-area`, `.url-card-error` via querySelector
+   *   - `updateCardWithMetadata()` finds `.url-title`, `.url-description`,
+   *     `.site-name`, `.url-card-image`, `.preview-image`
+   *   - `MessageEventDelegator` finds `data-action="url-card-click"`,
+   *     `url-ai-summarize`, `url-open-external`, `url-retry-preview`
+   *   - Static handlers (handleCardClick, handleOpenExternal, etc.)
+   *     find `.url-card` via `closest()` and read `dataset.url`
+   */
+  override renderMessageElement(message: ChatMessageEntity, _currentUserId: string): HTMLElement | null {
+    try {
+      const data = this.parseContent(message);
+      if (!data) return null;
+      this.contentData = data;
+
+      const { url, title, description, siteName, favicon, domain, isSecure, originalText } = data;
+      const cardId = `url-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+      const additionalText = originalText.replace(url, '').trim();
+
+      const wrapper = this.createAdapterWrapper();
+
+      const outer = document.createElement('div');
+      outer.className = 'url-card-content';
+      wrapper.appendChild(outer);
+
+      if (additionalText) {
+        const messageText = document.createElement('div');
+        messageText.className = 'url-message-text';
+        // textContent — additionalText originates from message.content.text
+        // and must not be interpreted as HTML.
+        messageText.textContent = additionalText;
+        outer.appendChild(messageText);
+      }
+
+      const card = document.createElement('div');
+      card.className = 'url-card';
+      card.dataset.cardId = cardId;
+      card.dataset.url = url;
+      card.dataset.action = 'url-card-click';
+      outer.appendChild(card);
+
+      // Loading state (visible by default; handleContentLoading hides it)
+      const loadingDiv = document.createElement('div');
+      loadingDiv.className = 'url-card-loading';
+      loadingDiv.style.display = 'block';
+      const spinner = document.createElement('div');
+      spinner.className = 'loading-spinner';
+      const loadingText = document.createElement('span');
+      loadingText.className = 'loading-text';
+      loadingText.textContent = 'Loading preview...';
+      loadingDiv.appendChild(spinner);
+      loadingDiv.appendChild(loadingText);
+      card.appendChild(loadingDiv);
+
+      // Content area (hidden until metadata loads)
+      const contentArea = document.createElement('div');
+      contentArea.className = 'url-card-content-area';
+      contentArea.style.display = 'none';
+      card.appendChild(contentArea);
+
+      const header = document.createElement('div');
+      header.className = 'url-card-header';
+      contentArea.appendChild(header);
+
+      const faviconImg = document.createElement('img');
+      faviconImg.src = favicon ?? '';
+      faviconImg.alt = `${domain} favicon`;
+      faviconImg.className = 'site-favicon';
+      faviconImg.loading = 'lazy';
+      header.appendChild(faviconImg);
+
+      const siteInfo = document.createElement('div');
+      siteInfo.className = 'site-info';
+      const siteNameEl = document.createElement('span');
+      siteNameEl.className = 'site-name';
+      siteNameEl.textContent = siteName ?? domain;
+      const urlDomain = document.createElement('span');
+      urlDomain.className = `url-domain ${isSecure ? 'secure' : 'insecure'}`;
+      // Lock/unlock glyph + space + domain, set as separate text nodes so
+      // domain stays escaped.
+      urlDomain.appendChild(document.createTextNode(isSecure ? '🔒 ' : '🔓 '));
+      urlDomain.appendChild(document.createTextNode(domain));
+      siteInfo.appendChild(siteNameEl);
+      siteInfo.appendChild(urlDomain);
+      header.appendChild(siteInfo);
+
+      const cardActions = document.createElement('div');
+      cardActions.className = 'card-actions';
+      cardActions.appendChild(this.buildActionButton('url-ai-summarize', '🤖', 'AI summarize'));
+      cardActions.appendChild(this.buildActionButton('url-open-external', '↗️', 'Open in new tab'));
+      header.appendChild(cardActions);
+
+      const cardBody = document.createElement('div');
+      cardBody.className = 'url-card-body';
+      contentArea.appendChild(cardBody);
+
+      const titleEl = document.createElement('h3');
+      titleEl.className = 'url-title';
+      titleEl.textContent = title ?? `Link to ${domain}`;
+      cardBody.appendChild(titleEl);
+
+      const descEl = document.createElement('p');
+      descEl.className = 'url-description';
+      descEl.textContent = description ?? '';
+      cardBody.appendChild(descEl);
+
+      const urlMetadata = document.createElement('div');
+      urlMetadata.className = 'url-metadata';
+      const urlFull = document.createElement('span');
+      urlFull.className = 'url-full';
+      urlFull.title = url;
+      urlFull.textContent = url;
+      urlMetadata.appendChild(urlFull);
+      cardBody.appendChild(urlMetadata);
+
+      // Image preview slot (hidden until metadata loads)
+      const imageContainer = document.createElement('div');
+      imageContainer.className = 'url-card-image';
+      imageContainer.style.display = 'none';
+      const previewImg = document.createElement('img');
+      previewImg.src = '';
+      previewImg.alt = 'Preview image';
+      previewImg.className = 'preview-image';
+      previewImg.loading = 'lazy';
+      imageContainer.appendChild(previewImg);
+      contentArea.appendChild(imageContainer);
+
+      // Error state (hidden until metadata load fails)
+      const errorDiv = document.createElement('div');
+      errorDiv.className = 'url-card-error';
+      errorDiv.style.display = 'none';
+      const errorContent = document.createElement('div');
+      errorContent.className = 'error-content';
+      const errorIcon = document.createElement('span');
+      errorIcon.className = 'error-icon';
+      errorIcon.textContent = '🔗';
+      const errorText = document.createElement('span');
+      errorText.className = 'error-text';
+      errorText.textContent = 'Preview unavailable';
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'retry-preview';
+      retryBtn.dataset.action = 'url-retry-preview';
+      retryBtn.dataset.url = url;
+      retryBtn.textContent = 'Retry';
+      errorContent.appendChild(errorIcon);
+      errorContent.appendChild(errorText);
+      errorContent.appendChild(retryBtn);
+      errorDiv.appendChild(errorContent);
+
+      const fallbackLink = document.createElement('div');
+      fallbackLink.className = 'fallback-link';
+      const externalLink = document.createElement('a');
+      externalLink.href = url;
+      externalLink.target = '_blank';
+      externalLink.rel = 'noopener noreferrer';
+      externalLink.className = 'external-link-fallback';
+      externalLink.textContent = url;
+      fallbackLink.appendChild(externalLink);
+      errorDiv.appendChild(fallbackLink);
+      card.appendChild(errorDiv);
+
+      return wrapper;
+    } catch (error) {
+      console.error('URLCardAdapter.renderMessageElement failed:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Helper to build an action button with consistent class + data-action,
+   * an aria-label mirroring the title (titles aren't reliable for SR),
+   * and a textContent label.
+   */
+  private buildActionButton(action: string, label: string, title: string): HTMLButtonElement {
+    const btn = document.createElement('button');
+    btn.className = 'action-button';
+    btn.dataset.action = action;
+    btn.title = title;
+    btn.setAttribute('aria-label', title);
+    btn.textContent = label;
+    return btn;
+  }
+
+  /**
    * Handle URL metadata fetching and card population
    */
   async handleContentLoading(element: HTMLElement): Promise<void> {
