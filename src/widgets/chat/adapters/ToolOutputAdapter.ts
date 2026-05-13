@@ -13,6 +13,14 @@ import type { ChatMessageEntity, MediaItem } from '../../../system/data/entities
 import { AbstractMessageAdapter } from './AbstractMessageAdapter';
 import { Events } from '../../../system/core/shared/Events';
 
+// Detached parser used by renderMessageElement to adopt the
+// already-HTML-escaped output of the per-tool sub-renderers into the
+// wrapper DOM without an innerHTML on a live element. Lazily created
+// inside renderMessageElement (not at module load) so this module
+// remains importable in non-browser contexts where `document` is
+// undefined — same pattern as TextMessageAdapter's parser.
+let toolHtmlParseTemplate: HTMLTemplateElement | null = null;
+
 // ────────────────────────────────────────────────────────────
 // Types
 // ────────────────────────────────────────────────────────────
@@ -431,6 +439,149 @@ export class ToolOutputAdapter extends AbstractMessageAdapter<ToolOutputContentD
     `;
   }
 
+  /**
+   * DOM-returning render path (see issue #1100). Scaffold (details,
+   * summary, action buttons, media images) is built via DOM APIs.
+   * Sub-renderer output is adopted via a detached `<template>` — the
+   * sub-renderers already escape user input through `escapeHtml`, so
+   * the same security boundary as before is preserved; only the
+   * destination changes (detached node instead of live element).
+   *
+   * Concrete wins vs the string path:
+   *   - data-tool-name / data-message-id now come from `dataset.*` —
+   *     no `${escapeHtml(toolName)}` attribute interpolation
+   *   - tool name in the summary uses `.textContent`, not interpolation
+   *   - inline tool images: img.src / img.alt via property, not
+   *     `<img src="${url}" alt="${escapeHtml(alt)}">` template
+   *   - tool icon: Unicode character via textContent, not numeric HTML
+   *     entity (which textContent wouldn't decode)
+   */
+  override renderMessageElement(message: ChatMessageEntity, _currentUserId: string): HTMLElement | null {
+    try {
+      const data = this.parseContent(message);
+      if (!data) return null;
+      this.contentData = data;
+
+      const renderer = this.renderers.get(data.toolName) ?? this.defaultRenderer;
+      const wrapper = this.createAdapterWrapper();
+
+      const details = document.createElement('details');
+      details.className = `tool-output-card ${data.success ? 'tool-success' : 'tool-failure'}`;
+      details.dataset.toolName = data.toolName;
+      wrapper.appendChild(details);
+
+      // Summary row
+      const summary = document.createElement('summary');
+      summary.className = 'tool-output-summary';
+
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'tool-icon';
+      iconSpan.textContent = this.getToolIconChar(data.toolCategory);
+      summary.appendChild(iconSpan);
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'tool-name';
+      nameSpan.textContent = data.toolName;
+      summary.appendChild(nameSpan);
+
+      const compactSpan = document.createElement('span');
+      compactSpan.className = 'tool-compact-info';
+      // Sub-renderer output is HTML with internal escapeHtml() calls on
+      // user-controlled bits. Adopt via detached template so the live
+      // summary element never sees an innerHTML assignment.
+      this.adoptHtml(compactSpan, renderer.renderCompact(data));
+      summary.appendChild(compactSpan);
+
+      if (!data.success) {
+        const statusIcon = document.createElement('span');
+        statusIcon.className = 'tool-status-icon';
+        statusIcon.textContent = '❌'; // ❌
+        summary.appendChild(statusIcon);
+      }
+      details.appendChild(summary);
+
+      // Detail container
+      const detail = document.createElement('div');
+      detail.className = 'tool-output-detail';
+
+      // Expanded content from the sub-renderer (already escapeHtml'd
+      // where user content appears)
+      this.adoptHtml(detail, renderer.renderExpanded(data));
+
+      // Inline media — rebuild via DOM construction so img.src / img.alt
+      // travel via property, not attribute interpolation
+      this.appendInlineMedia(detail, data.media);
+
+      // Action buttons
+      const actions = document.createElement('div');
+      actions.className = 'tool-output-actions';
+
+      const openBtn = document.createElement('button');
+      openBtn.className = 'tool-action-btn';
+      openBtn.dataset.action = 'tool-open-tab';
+      openBtn.dataset.messageId = data.messageId;
+      openBtn.dataset.toolName = data.toolName;
+      openBtn.title = 'Open in tab';
+      openBtn.setAttribute('aria-label', `Open ${data.toolName} output in tab`);
+      openBtn.textContent = 'Open';
+      actions.appendChild(openBtn);
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'tool-action-btn';
+      copyBtn.dataset.action = 'tool-copy';
+      copyBtn.dataset.messageId = data.messageId;
+      copyBtn.title = 'Copy output';
+      copyBtn.setAttribute('aria-label', `Copy ${data.toolName} output`);
+      copyBtn.textContent = 'Copy';
+      actions.appendChild(copyBtn);
+
+      detail.appendChild(actions);
+      details.appendChild(detail);
+
+      return wrapper;
+    } catch (error) {
+      console.error('ToolOutputAdapter.renderMessageElement failed:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Adopt an HTML string into a host element via a detached <template>
+   * so the live host never sees an innerHTML assignment. Caller's
+   * responsibility to ensure user content inside the html string is
+   * already escaped — the sub-renderers handle this via escapeHtml().
+   */
+  private adoptHtml(host: HTMLElement, html: string): void {
+    if (!toolHtmlParseTemplate) {
+      toolHtmlParseTemplate = globalThis.document.createElement('template');
+    }
+    toolHtmlParseTemplate.innerHTML = html;
+    host.appendChild(toolHtmlParseTemplate.content.cloneNode(true));
+  }
+
+  /**
+   * Build inline tool-output image elements directly via DOM (img.src
+   * + img.alt via property assignment). Mirrors renderInlineMedia()'s
+   * string output but without HTML attribute interpolation.
+   */
+  private appendInlineMedia(host: HTMLElement, media?: readonly MediaItem[]): void {
+    if (!media || media.length === 0) return;
+    const images = media.filter(m => m.type === 'image');
+    images.forEach((item, idx) => {
+      const url = item.url ?? (item.base64 ? `data:${item.mimeType ?? 'image/png'};base64,${item.base64}` : '');
+      if (!url) return;
+      const container = document.createElement('div');
+      container.className = 'tool-output-image';
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = item.alt ?? item.description ?? `Tool output ${idx + 1}`;
+      img.className = 'tool-inline-image';
+      img.loading = 'lazy';
+      container.appendChild(img);
+      host.appendChild(container);
+    });
+  }
+
   async handleContentLoading(_element: HTMLElement): Promise<void> {
     // Tool outputs are synchronous text — no async loading needed
   }
@@ -452,6 +603,25 @@ export class ToolOutputAdapter extends AbstractMessageAdapter<ToolOutputContentD
       data: '&#128451;',          // file cabinet
     };
     return icons[category] || '&#128295;'; // wrench default
+  }
+
+  /**
+   * Same icon mapping as getToolIcon but returns the Unicode codepoint
+   * as a real character (not an HTML numeric entity). Used by
+   * renderMessageElement, where the icon is set via `.textContent` —
+   * textContent does not decode `&#NNNN;` entities, so we need the
+   * character directly. Codepoints kept in sync with getToolIcon().
+   */
+  private getToolIconChar(category: string): string {
+    const codepoints: Record<string, number> = {
+      code: 0x25B6,         // ▶
+      screenshot: 0x1F4F7,  // 📷
+      ai: 0x1F916,          // 🤖
+      collaboration: 0x1F465, // 👥
+      data: 0x1F5C3,        // 🗃️
+    };
+    const cp = codepoints[category] ?? 0x1F527; // 🔧 wrench default
+    return String.fromCodePoint(cp);
   }
 
   private renderInlineMedia(media?: readonly MediaItem[]): string {
